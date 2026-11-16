@@ -737,6 +737,7 @@ class FastTokenizer {
     const items = [];
     let pos = 0;
     let start = 0;
+    let loose = false;
     if (ordered) start = parseInt(bullet.slice(0, -1), 10);
 
     const bulletLineLooks = (line) => {
@@ -747,13 +748,51 @@ class FastTokenizer {
     };
     // A line that ends the list in marked's inner loop (fence / heading /
     // html / blockquote / next bullet / hr start, at the current item's R).
-    const endsList = (line, r) =>
-      other.fencesBeginRegex(r).test(line) ||
-      other.headingBeginRegex(r).test(line) ||
-      other.htmlBeginRegex(r).test(line) ||
-      other.blockquoteBeginRegex(r).test(line) ||
-      other.nextBulletRegex(r).test(line) ||
-      other.hrRegex(r).test(line);
+    // First-char pre-check: none of these patterns can start with a
+    // plain-text character, so a plain line skips all six regexes.
+    const endsList = (line, r) => {
+      const sp = firstNonSpaceIdx(line);
+      if (sp > 3) return false;
+      const fc = line.charCodeAt(sp);
+      return (
+        ((fc === 96 || fc === 126) && other.fencesBeginRegex(r).test(line)) ||
+        (fc === 35 && other.headingBeginRegex(r).test(line)) ||
+        (fc === 60 && other.htmlBeginRegex(r).test(line)) ||
+        (fc === 62 && other.blockquoteBeginRegex(r).test(line)) ||
+        ((fc === 42 || fc === 43 || fc === 45 || (fc >= 48 && fc <= 57)) &&
+          other.nextBulletRegex(r).test(line)) ||
+        ((fc === 45 || fc === 95 || fc === 42) && other.hrRegex(r).test(line))
+      );
+    };
+
+    // Read one strict item line: null when it is not an item line,
+    // { other: true } when it is an item with a different bullet/delimiter.
+    const readItem = (line) => {
+      const m = ordered
+        ? /^ {0,3}(\d{1,9})([.)])( {1,4})([^ \t].*)$/.exec(line)
+        : /^ {0,3}([*+-])( {1,4})([^ \t].*)$/.exec(line);
+      if (!m) return null;
+      let indent = 0;
+      while (line.charCodeAt(indent) === 32) indent++;
+      if (ordered && m[2] !== delim) return { other: true, indent };
+      if (!ordered && m[1] !== bullet) return { other: true, indent };
+      return {
+        indent,
+        content: ordered ? m[4] : m[3],
+        r: indent + (ordered ? m[1].length + 1 : 1) + (ordered ? m[3].length : m[2].length),
+      };
+    };
+    // Is the line a new item of THIS list (rather than a nested one)?
+    // marked's nextBullet rule allows indent up to min(3, R-1) of the
+    // previous item; a deeper indent means continuation, not a new item.
+    // The same limit decides whether a different-bullet line starts a new
+    // list (break) or is a nested list inside the last item (bail).
+    const itemLimit = () =>
+      items.length === 0 ? 3 : Math.min(3, items.at(-1).r - 1);
+    const isNewItem = (it) =>
+      it !== null && !it.other && it.indent <= itemLimit();
+    const otherIsNewList = (it) =>
+      it !== null && it.other && it.indent <= itemLimit();
 
     while (pos < n) {
       const nl = src.indexOf('\n', pos);
@@ -762,13 +801,54 @@ class FastTokenizer {
       const nextPos = nl === -1 ? n : nl + 1;
 
       // An hr at an item start ends the list (marked checks it per item).
-      if (items.length > 0 && BLOCK.hr.test(src.slice(pos))) break;
+      // Test the line only: the hr pattern is single-line and anchored.
+      if (items.length > 0 && BLOCK.hr.test(line)) break;
 
-      const item = ordered
-        ? /^(\d{1,9})([.)])( {1,4})([^ \t].*)$/.exec(line)
-        : /^([*+-])( {1,4})([^ \t].*)$/.exec(line);
-      if (!item) {
-        if (line === '' || /^[ \t]*$/.test(line)) return null; // blank line
+      const item = readItem(line);
+      if (item && item.other) {
+        // Different bullet/delimiter: a new list only when the indent is
+        // shallow enough; deeper it is a nested list in the last item.
+        if (otherIsNewList(item)) break;
+        return null;
+      }
+      if (item === null) {
+        if (line === '' || /^[ \t]*$/.test(line)) {
+          // Blank line(s): if another item of this list follows, the list
+          // is loose; if nothing else follows, the list simply ends.
+          let p = nextPos;
+          while (p < n) {
+            const nl2 = src.indexOf('\n', p);
+            const le2 = nl2 === -1 ? n : nl2;
+            const l2 = src.slice(p, le2);
+            if (l2 === '' || /^[ \t]*$/.test(l2)) { p = nl2 === -1 ? n : nl2 + 1; continue; }
+            break;
+          }
+          if (p >= n) break;
+          const nl2 = src.indexOf('\n', p);
+          const l2 = src.slice(p, nl2 === -1 ? n : nl2);
+          const next = readItem(l2);
+          if (isNewItem(next)) {
+            loose = true;
+            pos = p;
+            continue;
+          }
+          // Different bullet after the blank: a new list only when the
+          // indent is shallow enough; deeper it is a nested list.
+          if (next && next.other) {
+            if (otherIsNewList(next)) break;
+            return null;
+          }
+          // A block-start line after the blanks ends the list; a plain line
+          // does too (the blank already broke the item). Anything else is
+          // a nested/continuation shape: let the full algorithm decide.
+          if (endsList(l2, items.at(-1).r)) break;
+          if (
+            l2[0] !== ' ' && l2[0] !== '\t' &&
+            !/^ {0,3}(?:=+|-+) *$/.test(l2) &&
+            !bulletLineLooks(l2)
+          ) break;
+          return null;
+        }
         if (line[0] === ' ' || line[0] === '\t') return null; // continuation?
         if (/^ {0,3}(?:=+|-+) *$/.test(line)) return null; // setext-looking
         if (bulletLineLooks(line)) return null; // same bullet, odd shape
@@ -777,13 +857,11 @@ class FastTokenizer {
         if (items.length > 0 && endsList(line, items.at(-1).r)) break;
         return null;
       }
-      if (ordered && item[2] !== delim) break; // different delimiter: new list
-      if (!ordered && item[1] !== bullet) break; // different bullet: new list
-      if (ordered && item[1].length > 9) return null;
+      if (!isNewItem(item)) return null; // nested item, not a new one
 
-      let content = ordered ? item[4] : item[3];
-      // Separator is 1-4 spaces by the pattern; content must be a single
-      // plain-text token, not another block construct.
+      let content = item.content;
+      // Content must be a single plain-text token, not another block
+      // construct.
       const c0 = content[0];
       if (
         (c0 === '#' && BLOCK.heading.test(content)) ||
@@ -798,23 +876,22 @@ class FastTokenizer {
         return null;
       }
 
-      // R = content indent of this item (bullet length + separator).
-      const sepLen = (ordered ? item[3] : item[2]).length;
-      const bulletLen = ordered ? item[1].length + 1 : 1;
-      const r = bulletLen + sepLen;
-      items.push({ start: pos, end: nextPos, content, r });
+      items.push({ start: pos, end: nextPos, content, r: item.r });
       pos = nextPos;
     }
 
     if (items.length === 0) return null;
     const consumed = pos;
+    // An item's raw runs up to the next item's start (so interior blank
+    // lines belong to the item, as in marked).
+    for (let i = 0; i < items.length - 1; i++) items[i].end = items[i + 1].start;
 
     const listToken = {
       type: 'list',
       raw: src.slice(0, consumed).trimEnd(),
       ordered,
       start: ordered ? start : '',
-      loose: false,
+      loose,
       items: [],
     };
 
@@ -837,14 +914,29 @@ class FastTokenizer {
           text = text.replace(other.listReplaceTask, '');
         }
       }
-      const textToken = { type: 'text', raw: text, text, tokens: [] };
-      this.lexer.inline(text, textToken.tokens);
-      const tokens = checkbox ? [checkbox, textToken] : [textToken];
+      // A loose list turns each item's text token into a paragraph; a task
+      // checkbox moves inside the paragraph (raw/text prefixed with it).
+      let tokens;
+      if (loose) {
+        const para = {
+          type: 'paragraph',
+          raw: checkbox ? checkbox.raw + text : text,
+          text: checkbox ? checkbox.raw + text : text,
+          tokens: [],
+        };
+        if (checkbox) para.tokens.push(checkbox);
+        this.lexer.inline(text, para.tokens);
+        tokens = [para];
+      } else {
+        const textToken = { type: 'text', raw: text, text, tokens: [] };
+        this.lexer.inline(text, textToken.tokens);
+        tokens = checkbox ? [checkbox, textToken] : [textToken];
+      }
       listToken.items.push({
         type: 'list_item',
         raw: itemRaw,
         task,
-        loose: false,
+        loose,
         text,
         tokens,
         ...(checked !== undefined ? { checked } : {}),
@@ -907,13 +999,20 @@ class FastTokenizer {
         for (; rest; ) {
           const curLine = rest.split('\n', 1)[0];
           let expanded;
+          // First-char pre-check: every break pattern starts with one of
+          // ` ~ # < > * + - digit, after at most 3 spaces. A plain-text
+          // line cannot break the item, so skip all six regexes for it.
+          const sp = firstNonSpaceIdx(curLine);
+          const fc = curLine.charCodeAt(sp);
           if (
-            fencesRe.test(curLine) ||
-            headingRe.test(curLine) ||
-            htmlRe.test(curLine) ||
-            quoteRe.test(curLine) ||
-            nextBulletRe.test(curLine) ||
-            hrRe.test(curLine)
+            sp <= 3 &&
+            (((fc === 96 || fc === 126) && fencesRe.test(curLine)) ||
+              (fc === 35 && headingRe.test(curLine)) ||
+              (fc === 60 && htmlRe.test(curLine)) ||
+              (fc === 62 && quoteRe.test(curLine)) ||
+              ((fc === 42 || fc === 43 || fc === 45 || (fc >= 48 && fc <= 57)) &&
+                nextBulletRe.test(curLine)) ||
+              ((fc === 45 || fc === 95 || fc === 42) && hrRe.test(curLine)))
           ) {
             break;
           }
@@ -921,13 +1020,16 @@ class FastTokenizer {
           if (expanded.search(other.nonSpaceChar) >= indent || !curLine.trim()) {
             itemText += '\n' + expanded.slice(indent);
           } else {
+            const lsp = firstNonSpaceIdx(line);
+            const lfc = line.charCodeAt(lsp);
             if (
               prevBlank ||
               line.replace(other.tabCharGlobal, '    ').search(other.nonSpaceChar) >= 4 ||
-              fencesRe.test(line) ||
-              headingRe.test(line) ||
-              htmlRe.test(line) ||
-              hrRe.test(line)
+              (lsp <= 3 &&
+                (((lfc === 96 || lfc === 126) && fencesRe.test(line)) ||
+                  (lfc === 35 && headingRe.test(line)) ||
+                  (lfc === 60 && htmlRe.test(line)) ||
+                  ((lfc === 45 || lfc === 95 || lfc === 42) && hrRe.test(line))))
             ) {
               break;
             }
@@ -1379,30 +1481,37 @@ function fixFenceIndent(raw, text, rules) {
 // char dispatch and a single-scan text matcher.
 // ---------------------------------------------------------------------------
 
-const URL_STOP = /[\s<]/;
+/** First non-space char code of the second line of src, or -1 when there
+ * is no second line or it is indented more than 3 spaces (a table delimiter
+ * row only allows {0,3} leading spaces there). */
+function secondLineFirstChar(src) {
+  const nl = src.indexOf('\n');
+  if (nl === -1) return -1;
+  let i = nl + 1;
+  let sp = 0;
+  while (src.charCodeAt(i) === 32 && sp < 4) { i++; sp++; }
+  if (sp >= 4) return -1;
+  return src.charCodeAt(i);
+}
 
-/** Cheap gate: can the URL tokenizer possibly match at the start of src? */
+/** Index of the first non-space character of a line (tabs count as content:
+ * the list break regexes only allow literal leading spaces). */
+function firstNonSpaceIdx(line) {
+  let i = 0;
+  while (line.charCodeAt(i) === 32) i++;
+  return i;
+}
+
+/** Cheap gate: can the URL tokenizer possibly match at the start of src?
+ * Only the first word can be a URL/email and schemes are short, so bound
+ * the check to the prefix instead of scanning the whole remaining source. */
 function couldBeUrl(src) {
-  const c = src[0];
-  if (c === 'w' && src.startsWith('www.')) return true;
-  if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
-    const colon = src.indexOf(':');
-    if (colon > 0 && colon < 32) return true;
-    const at = src.indexOf('@');
-    if (at > 0) {
-      const stop = src.search(URL_STOP);
-      if (stop === -1 || at < stop) return true;
-    }
-    return false;
-  }
-  if ((c >= '0' && c <= '9') || c === '.' || c === '_' || c === '+' || c === '-') {
-    const at = src.indexOf('@');
-    if (at > 0) {
-      const stop = src.search(URL_STOP);
-      if (stop === -1 || at < stop) return true;
-    }
-  }
-  return false;
+  if (src.startsWith('www.')) return true;
+  // scheme: (http:, https:, ftp:, mailto:, xmpp:) — at most 32 chars.
+  if (/^[A-Za-z][A-Za-z0-9+.-]{0,31}:/.test(src)) return true;
+  // Bare email: the first word is [A-Za-z0-9._+-]+ and is followed by '@'.
+  const word = /^[A-Za-z0-9._+-]+/.exec(src);
+  return !!word && src[word[0].length] === '@';
 }
 
 class FastLexer {
@@ -1529,7 +1638,15 @@ class FastLexer {
         }
         continue;
       }
-      if ((tok = this.tokenizer.table(src))) {
+      // A table needs a delimiter row on the second line; skip its regex
+      // when the second line cannot start one. (Setext headings are left
+      // ungated: the underline may sit on any line of the paragraph, and
+      // every gate tried for it cost more than the regex itself.)
+      const slc = secondLineFirstChar(src);
+      if (
+        (slc === 124 || slc === 58 || slc === 45) &&
+        (tok = this.tokenizer.table(src))
+      ) {
         src = src.substring(tok.raw.length);
         tokens.push(tok);
         continue;
@@ -1655,11 +1772,12 @@ class FastLexer {
   }
 
   inlineLoop(src, tokens) {
-    // The mask only feeds emStrong/del, so skip it when the source holds no
-    // delimiter that could open or close one.
+    // The mask only feeds emStrong/del, so skip it (and the scan behind it)
+    // when the source holds no delimiter that could open or close one.
     const needsMask = src.includes('*') || src.includes('_') || src.includes('~');
     const masked = needsMask ? this.maskInline(src) : src;
-    this.tokenizer.maskStack.push(scanMask(masked));
+    const pushed = needsMask;
+    if (pushed) this.tokenizer.maskStack.push(scanMask(masked));
     try {
       let merged = false;
       let prevChar = '';
@@ -1733,7 +1851,7 @@ class FastLexer {
       }
       return tokens;
     } finally {
-      this.tokenizer.maskStack.pop();
+      if (pushed) this.tokenizer.maskStack.pop();
     }
   }
 

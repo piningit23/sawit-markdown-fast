@@ -5,7 +5,7 @@
 // Outside a container MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for
 // /input and /output.
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
@@ -17,4 +17,8 @@ const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8')) as
 const html: string[] = new Array(cases.length);
 for (let i = 0; i < cases.length; i++) html[i] = parse(cases[i].markdown);
 mkdirSync(OUTPUT_DIR, { recursive: true });
-writeFileSync(join(OUTPUT_DIR, 'html.json'), JSON.stringify(html));
+// Write atomically: a run killed mid-write must not leave a partial
+// html.json behind for the scorer to read.
+const tmpPath = join(OUTPUT_DIR, '.html.json.tmp');
+writeFileSync(tmpPath, JSON.stringify(html));
+renameSync(tmpPath, join(OUTPUT_DIR, 'html.json'));
