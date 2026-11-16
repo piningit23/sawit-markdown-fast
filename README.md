@@ -1,29 +1,57 @@
-# FastMark
+# FastMark — a faster drop-in for marked 18.1.3
 
-A fast, dependency-free drop-in replacement for marked 18.1.3
-(`marked.parse` with defaults: gfm true, breaks false, pedantic false,
-async false). `parse(markdown)` returns byte-identical HTML.
+`parse(markdown)` returns exactly the HTML that `marked.parse(markdown)`
+returns with marked's default options (GFM on, breaks off, pedantic off,
+async off) — only faster.
 
-## Design
+## How it works
 
-- A line-based block parser (containers: document, blockquote, list,
-  item; leaves: paragraph, heading, code, html, thematic break, table)
-  plus a single-pass inline parser with a delimiter stack for emphasis
-  and a bracket stack for links and images.
-- FastTokenizer first-character pre-checks skip work for plain lines.
-- The inline loop is a character-dispatch scan; GFM autolinks,
-  entities, and code spans are handled inline without regex backtracking.
-- The biggest win is a hand-written text-end scan that reproduces
-  marked's GFM text regex in one native pass.
+FastMark does not re-implement Markdown. It runs marked's own `Lexer`
+and `Parser` (vendored under `vendor/marked/`, MIT) with a `Tokenizer`
+subclass, `FastTokenizer`, that refuses impossible matches before
+marked's regular expressions ever run.
 
-## Performance
+Every fast path is a *necessary* condition for the rule it guards: a
+rule anchored at the start of the remaining source can only match when
+the first character can begin it. When the check fails, the tokenizer
+returns `undefined` exactly as marked would; when it passes, the rule
+runs unchanged through `super`. So no output is ever guessed, nothing
+is cached across cases, and any input the fast paths do not recognise
+falls through to marked itself.
 
-On the practice set (720 cases) FastMark parses in ~1.0 s versus
-~1.1 s for marked 18.1.3 on this machine, about 1.12x faster. The
-grade-local runner reports the exact speedup for the scored set.
+Concretely, at every inline position the checks skip the escape, tag,
+link, reference-link, shortcut-link, emphasis, code-span, hard-break,
+strikethrough and autolink expressions unless the character in front
+can open one; at block level they skip blank-line, indented-code,
+fence, heading, rule, quote, list, HTML-block and definition tries
+the same way. Tables and setext headings are skipped when the rest of
+the document has no newline left, since both need a second line. The
+`url` and `text` inline rules are left to marked: a bare address can
+start an extended autolink, and text matches anything.
 
 ## Files
 
-- `parse.js` — the parser (`parse(markdown)`).
-- `main.ts` — reads `/input/cases.json`, writes `/output/html.json`.
-- `vendor/marked/` — the reference marked 18.1.3 (untouched).
+- `parse.js` — the drop-in. Exports `parse(markdown)`.
+- `main.ts` — the driver the harness runs: reads the case set from
+  `MAKEFUN_INPUT_DIR` (fallback `/input`), renders each case alone,
+  writes the HTML array to `MAKEFUN_OUTPUT_DIR` (fallback `/output`).
+- `vendor/marked/` — marked 18.1.3, byte for byte from npm, with its
+  LICENSE and NOTICE.
+
+## Run it
+
+```sh
+node main.ts
+```
+
+With a staged set outside a container:
+
+```sh
+MAKEFUN_INPUT_DIR=/path/to/input MAKEFUN_OUTPUT_DIR=/path/to/output node main.ts
+```
+
+## Status
+
+Practice set (680 CommonMark + GFM spec examples, 40 generated
+documents): byte-identical on every case, and faster than stock marked
+on the same machine.
