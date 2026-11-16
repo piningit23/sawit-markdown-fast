@@ -554,7 +554,8 @@ function tryGfmAutolink(src, i, prevOk, delims) {
     const domEnd = scanGfmDomain(src, domStart);
     if (domEnd === -1) return null;
     let end = domEnd;
-    if (src[end] === '/' || src[end] === '?' || src[end] === '#') {
+    if (src[end] === '/' || src[end] === '?' || src[end] === '#' ||
+      src[end] === '\\' || src[end] === '.') {
       end++;
       while (end < n) {
         const cc = src.charCodeAt(end);
