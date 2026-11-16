@@ -292,10 +292,29 @@ class FastTokenizer extends Tokenizer {
   }
 
   list(src) {
-    const c = src.charCodeAt(0);
-    // A list opens with a bullet (*, -, +), an ordered marker (a digit),
-    // or up to three spaces of indent before one of those.
-    if (c !== 32 && c !== 42 && c !== 45 && c !== 43 && (c < 48 || c > 57)) return undefined;
+    // A list opens with a bullet (*, -, +) or an ordered marker
+    // (one to nine digits, then '.' or ')'), after at most three
+    // spaces of indent — and the marker must be followed by a space,
+    // a tab, a newline, or the end of the source. Anything else (a
+    // paragraph starting with a year, '-foo', '1.foo', four spaces
+    // of indent) cannot be a list, so the long list expression is
+    // never run on it.
+    let i = 0;
+    while (i < 3 && src.charCodeAt(i) === 32) i++;
+    const c = src.charCodeAt(i);
+    if (c === 42 || c === 45 || c === 43) {
+      const n = src.charCodeAt(i + 1);
+      if (n !== 32 && n !== 9 && n !== 10 && src.length !== i + 1) return undefined;
+    } else if (c >= 48 && c <= 57) {
+      let j = i;
+      while (j < i + 9 && src.charCodeAt(j) >= 48 && src.charCodeAt(j) <= 57) j++;
+      const d = src.charCodeAt(j);
+      if (d !== 46 && d !== 41) return undefined; // . or )
+      const n = src.charCodeAt(j + 1);
+      if (n !== 32 && n !== 9 && n !== 10 && src.length !== j + 1) return undefined;
+    } else {
+      return undefined;
+    }
     return super.list(src);
   }
 
